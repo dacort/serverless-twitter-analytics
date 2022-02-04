@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: 2010-09-09
+Conditions:
+  InUsEast1: !Equals
+    - !Ref "AWS::Region"
+    - us-east-1
+Resources:
+  DeliveryBucket:
+    Type: "AWS::S3::Bucket"
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: "Role to allow Glue read-only access to specific S3 buckets"
+  GlueCrawlerReadOnlyPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Roles:
+        - Ref: "GlueCrawlerRole"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3Read
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetEncryptionConfiguration
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${DeliveryBucket}"
+              - !Sub "arn:aws:s3:::${DeliveryBucket}/*"
+          - Sid: AllowLogging
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - "arn:aws:logs:*:*:/aws-glue/*"
+          - Sid: AllowAllGlueActions
+            Effect: Allow
+            Action:
+              - glue:*
+            Resource:
+              - "*"
+  MSKConnectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - kafkaconnect.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: "Role to allow MSK Connect read/write access to specific S3 buckets"
+  MSKConnectPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Roles:
+        - Ref: "MSKConnectRole"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowConnectToCluster
+            Effect: Allow
+            Action:
+              - kafka-cluster:Connect
+              - kafka-cluster:DescribeCluster
+            Resource:
+              - !Ref MSKCluster
+          - Sid: AllowTopicReadAndWrite
+            Effect: Allow
+            Action:
+              - kafka-cluster:ReadData
+              - kafka-cluster:WriteData
+              - kafka-cluster:DescribeTopic
+              - kafka-cluster:CreateTopic
+            Resource:
+              - !Sub
+                - "${TopicARN}/*"
+                - { TopicARN : !Join [ ':topic/', !Split [ ':cluster/', !Ref MSKCluster ] ] }
+              - !Join [ ':topic/', !Split [ ':cluster/', !Ref MSKCluster ] ]
+          - Sid: AllowGroupReadAndWrite
+            Effect: Allow
+            Action:
+              - kafka-cluster:AlterGroup
+              - kafka-cluster:DescribeGroup
+            Resource:
+              - !Sub
+                - "${TopicARN}/__amazon_msk_connect_*"
+                - { TopicARN : !Join [ ':group/', !Split [ ':cluster/', !Ref MSKCluster ] ] }
+              - !Sub
+                - "${TopicARN}/connect-*"
+                - { TopicARN : !Join [ ':group/', !Split [ ':cluster/', !Ref MSKCluster ] ] }
+          - Sid: AllowS3Read
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:PutObject
+              - s3:GetEncryptionConfiguration
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+              - s3:ListBucketMultipartUploads
+            Resource:
+              - !Sub "arn:aws:s3:::${DeliveryBucket}"
+              - !Sub "arn:aws:s3:::${DeliveryBucket}/*"
+  MSKCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      BrokerNodeGroupInfo:
+        ClientSubnets:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        InstanceType: "kafka.m5.large"
+      ClientAuthentication:
+        Unauthenticated:
+          Enabled: true
+      ClusterName: "serverless-analytics"
+      KafkaVersion: "2.6.2" # Recommended per https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html
+      LoggingInfo:
+         BrokerLogs:
+          S3:
+            Bucket: !Ref DeliveryBucket
+            Enabled: true
+            Prefix: "msk-logs/"
+      NumberOfBrokerNodes: 2
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Configuration: "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"}},\"Grouping\":{\"TableGroupingPolicy\":\"CombineCompatibleSchemas\"}}"
+      DatabaseName: "default"
+      Description: "Crawler for Twitter JSON data"
+      Name: "wordle_json"
+      RecrawlPolicy:
+        RecrawlBehavior: "CRAWL_NEW_FOLDERS_ONLY"
+      Role: !Ref GlueCrawlerRole
+      Schedule:
+        ScheduleExpression: "cron(06 0/1 * * ? *)"
+      SchemaChangePolicy:
+        DeleteBehavior: "LOG"
+        UpdateBehavior: "LOG"
+      TablePrefix: "wordle_"
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DeliveryBucket}/wordle_data/json/"
+  VPC:
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: true
+    Type: 'AWS::EC2::VPC'
+  VPCDHCPAssociation:
+    Properties:
+      DhcpOptionsId: !Ref VPCDHCPOptions
+      VpcId: !Ref VPC
+    Type: 'AWS::EC2::VPCDHCPOptionsAssociation'
+  VPCDHCPOptions:
+    Properties:
+      DomainName: !If 
+        - InUsEast1
+        - ec2.internal
+        - !Sub '${AWS::Region}.compute.internal'
+      DomainNameServers:
+        - AmazonProvidedDNS
+    Type: 'AWS::EC2::DHCPOptions'
+  VpcCidrBlock1:
+    Type: 'AWS::EC2::VPCCidrBlock'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 172.16.0.0/16
+  GatewayAttachment:
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+  PublicRouteTableIGWRoute:
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+    Type: 'AWS::EC2::Route'
+  PublicRouteTable:
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+      VpcId: !Ref VPC
+    Type: 'AWS::EC2::RouteTable'
+  PublicSubnetRouteTableAssociation:
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+  PublicSubnet1:
+    DependsOn: VpcCidrBlock1
+    Properties:
+      Tags:
+        - Key: Name
+          Value: PublicSubnet1
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: true
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: 'true'
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      CidrBlock: 172.16.0.0/20
+    Type: 'AWS::EC2::Subnet'
+  NATGateway:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !GetAtt 
+        - ElasticIPAddress
+        - AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: NAT
+  ElasticIPAddress:
+    Type: 'AWS::EC2::EIP'
+    Properties:
+      Domain: VPC
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Private Route Table
+      VpcId: !Ref VPC
+  PrivateRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+  PrivateSubnet1:
+    DependsOn: VpcCidrBlock1
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet1
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: true
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: 'false'
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      CidrBlock: 172.31.0.0/20
+  PrivateSubnetRouteTableAssociation1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+  PrivateSubnet2:
+    DependsOn: VpcCidrBlock1
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet2
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: true
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: 'false'
+      AvailabilityZone: !Select 
+        - 1
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      CidrBlock: 172.31.16.0/20
+  PrivateSubnetRouteTableAssociation2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+  S3Endpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: '*'
+            Principal: '*'
+            Resource: '*'
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
